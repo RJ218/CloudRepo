@@ -4,6 +4,7 @@ const { SQSClient, SendMessageCommand, GetQueueAttributesCommand } = require("@a
 const { AutoScalingClient, SetDesiredCapacityCommand, DescribeScalingActivitiesCommand } = require("@aws-sdk/client-auto-scaling");
 const { Consumer } = require('sqs-consumer');
 const { v4: uuidv4 } = require('uuid');
+const { EC2Client, RunInstancesCommand, TerminateInstancesCommand } = require("@aws-sdk/client-ec2");
 
 const app = express();
 const port = 8080;
@@ -11,20 +12,36 @@ const upload = multer({ dest: 'uploads/' });
 
 // Initialize AWS clients
 const sqsClient = new SQSClient({ region: "us-east-2" });
-const autoScalingClient = new AutoScalingClient({ region: "us-east-2" });
+const ec2Client = new EC2Client({ region: "us-east-2" });
 
 const URL_REQUEST_SQS = "https://sqs.us-east-2.amazonaws.com/992382822519/RequestQueue-1";
 const URL_RESPONSE_SQS = "https://sqs.us-east-2.amazonaws.com/992382822519/ResponseQueue-1";
 const ASG_NAME = 'WebTierAutoScaling';
+const APP_TIER_AMI_ID = 'ami-0b366c4eac5626dfe'
+const KEY_PAIR_LOGIN_NAME = "my_key_pair_cloud_assnmnt"
+const IAM_ROLE = "s3-fullAccess"
+const SECURITY_GROUP_ID = "sg-04295adadef148233"
+const START_SCRIPT = `#!/bin/bash
+cd /home/ec2-user/
+sudo -u ec2-user node appTier.js`;
+
+// Thresholds for scaling actions
+const SCALE_OUT_THRESHOLD = 5;
+const SCALE_IN_THRESHOLD = 5;
+const SCALE_CHECK_INTERVAL = 10000;
+const MAX_INSTANCES = 10;
+const MIN_INSTANCES = 0;
 
 // Storage for pending requests
 const pendingRequests = new Map();
+const ec2InstanceSet = new Set();
 
 // Tracking for scale-in and scale-out
 let lastActivityTime = Date.now();
 let lastScaleInReqTime = Date.now();
 let scaleOutCooldown = false;
 
+let instanceCount = 0;
 
 app.post('/', upload.single('inputFile'), async (req, res) => {
     if (!req.file) {
@@ -43,41 +60,17 @@ app.post('/', upload.single('inputFile'), async (req, res) => {
         console.log('Request sent to SQS:', correlationId);
         // Store the response object to use later once the response message is received
         pendingRequests.set(correlationId, res);
+		if (instanceCount == 0)
+		{
+			console.log('post API, no ec2Instance found');
+			await manageScaling();
+		}
         lastActivityTime = Date.now(); // Update last activity time
     } catch (error) {
         console.error("Error sending message to SQS:", error);
         res.status(500).send('Failed to process the file upload.');
     }
 });
-
-async function adjustScaling() {
-	const scalingInProgress = await checkIfScalingActivityInProgress(ASG_NAME);
-
-	if (scalingInProgress) {
-        console.log('A scaling operation is already in progress. Skipping...');
-        return;
-    }
-	
-    const queueLength = await getQueueLength(URL_REQUEST_SQS);
-    const currentTime = Date.now();
-    const timeSinceLastActivity = (currentTime - lastActivityTime) / 1000; // Convert to seconds
-	const timeSinceLastScaleIn = (currentTime - lastScaleInReqTime) / 1000;
-	
-    // Scale down after 30 seconds of inactivity
-    if (timeSinceLastActivity > 30 && timeSinceLastScaleIn > 30) {
-        console.log('Scaling down due to inactivity.');
-        await setDesiredCapacity(ASG_NAME, 0);
-		lastScaleInReqTime = Date.now();
-    } else if (!scaleOutCooldown || (currentTime - lastActivityTime) >= 15000) { // 15 seconds cooldown for additional scale-out
-        if (queueLength > 0) {
-            console.log('Scaling out due to activity.');
-            const desiredCapacity = Math.min(Math.max(1, queueLength), 5); // Adjust desired capacity based on queue
-            await setDesiredCapacity(ASG_NAME, desiredCapacity);
-            scaleOutCooldown = true;
-            setTimeout(() => { scaleOutCooldown = false; }, 15000); // Reset scale-out cooldown after 15 seconds
-        }
-    }
-}
 
 // Helper function to send message to SQS
 const sendMessageToSQS = async (queueUrl, messageBody) => {
@@ -105,59 +98,79 @@ async function getQueueLength(queueUrl) {
     return parseInt(response.Attributes.ApproximateNumberOfMessages, 10);
 }
 
-async function setDesiredCapacity(asgName, desiredCapacity) {
-
-	const command = new SetDesiredCapacityCommand({
-        AutoScalingGroupName: asgName,
-        DesiredCapacity: desiredCapacity,
-        HonorCooldown: true,
-    });
+async function launchNewInstance() {
+    const params = {
+        ImageId: APP_TIER_AMI_ID,
+        InstanceType: "t2.micro",
+        MinCount: 1,
+        MaxCount: 1,
+        // Include additional configuration as needed (e.g., security groups, key pair, subnet ID)
+        KeyName: KEY_PAIR_LOGIN_NAME,
+        SecurityGroupIds: [SECURITY_GROUP_ID],
+		IamInstanceProfile: {
+			Name: IAM_ROLE
+		},
+		UserData: Buffer.from(START_SCRIPT).toString('base64')
+    };
 
     try {
-		const scalingInProgress = await checkIfScalingActivityInProgress(ASG_NAME);
-
-		if (scalingInProgress) {
-			console.log('A scaling operation is already in progress. Skipping...');
-			return;
+		if (instanceCount >= MAX_INSTANCES)
+		{
+			console.log('max instances reached, increase total limit')
+			return
 		}
-        await autoScalingClient.send(command);
-        console.log(`Adjusted desired capacity to ${desiredCapacity}.`);
-    } catch (error) {
-        console.error('Failed to adjust desired capacity:', error);
-		// Check for the ScalingActivityInProgressFault error
-        if (error.name === 'ScalingActivityInProgressFault') {
-            console.log('Scaling activity is in progress, will retry later.');
-        }
-    }finally {
-        // Reset the flag after the operation completes or fails
+		instanceCount++;
+        const data = await ec2Client.send(new RunInstancesCommand(params));
+        console.log("Successfully launched instance", data.Instances[0].InstanceId);
+		ec2InstanceSet.add(data.Instances[0].InstanceId);
 
+        // Additional setup or tagging can be done here
+    } catch (error) {
+        console.error("Failed to launch instance:", error);
+		instanceCount--;
     }
 }
 
-async function checkIfScalingActivityInProgress(asgName) {
-    const command = new DescribeScalingActivitiesCommand({
-        AutoScalingGroupName: asgName,
-        // Optionally, you can specify a maximum number of activities to return
-        // MaxRecords: 1
-    });
+
+async function terminateInstance(instanceId) {
+    const params = {
+        InstanceIds: [instanceId],
+    };
 
     try {
-        const response = await autoScalingClient.send(command);
-        const activities = response.Activities;
-
-        // Filter for in-progress activities
-        const inProgressActivities = activities.filter(activity => activity.StatusCode === 'InProgress');
-
-        if (inProgressActivities.length > 0) {
-            console.log('There is a scaling activity in progress.');
-            return true; // Indicates that there is a scaling activity in progress
-        } else {
-            console.log('No scaling activities are in progress.');
-            return false; // Indicates that there are no scaling activities in progress
-        }
+		instanceCount--;
+        await ec2Client.send(new TerminateInstancesCommand(params));
+        console.log(`Successfully requested termination of instance ${instanceId}`);
+		ec2InstanceSet.delete(instanceId);
     } catch (error) {
-        console.error('Failed to retrieve scaling activities:', error);
-        throw error;
+		instanceCount++;
+        console.error("Failed to terminate instance:", error);
+    }
+}
+
+
+async function manageScaling() {
+    const pendingSize = pendingRequests.size;
+	console.log("checking scaling");
+	console.log("instanceCount = ", instanceCount);
+	console.log("pendingSize = ", pendingSize);
+	if (instanceCount == 0 && pendingSize > 0)
+	{
+		console.log("No instance detected, launching right away");
+		await launchNewInstance();
+	}
+	
+    // Scale Out: If pending requests exceed the threshold, launch a new instance.
+    else if (pendingSize / instanceCount >= SCALE_OUT_THRESHOLD && instanceCount < MAX_INSTANCES) {
+        console.log("Scaling out due to high load...");
+        await launchNewInstance();
+    }
+    // Scale In: If the load decreases significantly, terminate an instance.
+    else if (pendingSize <= (SCALE_IN_THRESHOLD * instanceCount)/2 && instanceCount > MIN_INSTANCES) {
+        console.log("Scaling in due to low load...");
+		const iterator = ec2InstanceSet.values();
+		const first = iterator.next().value;
+        await terminateInstance(first);
     }
 }
 
@@ -193,8 +206,9 @@ responseConsumer.on('processing_error', (err) => {
 
 responseConsumer.start();
 
-// Periodically adjust the ASG based on the SQS queue length and activity
-setInterval(adjustScaling, 3000); // Check every 3 seconds
+setInterval(() => {
+        manageScaling();
+    }, SCALE_CHECK_INTERVAL);
 
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
