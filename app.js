@@ -27,7 +27,7 @@ sudo -u ec2-user node appTier.js`;
 
 // Thresholds for scaling actions
 const SCALE_OUT_THRESHOLD = 5;
-const SCALE_IN_THRESHOLD = 5;
+const SCALE_IN_THRESHOLD = 0;
 const SCALE_CHECK_INTERVAL = 10000;
 const MAX_INSTANCES = 10;
 const MIN_INSTANCES = 0;
@@ -166,7 +166,7 @@ async function manageScaling() {
         await launchNewInstance();
     }
     // Scale In: If the load decreases significantly, terminate an instance.
-    else if (pendingSize <= (SCALE_IN_THRESHOLD * instanceCount)/2 && instanceCount > MIN_INSTANCES) {
+    else if (pendingSize <= SCALE_IN_THRESHOLD && instanceCount > MIN_INSTANCES) {
         console.log("Scaling in due to low load...");
 		const iterator = ec2InstanceSet.values();
 		const first = iterator.next().value;
